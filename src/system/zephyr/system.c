@@ -21,6 +21,7 @@
 #endif
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -70,28 +71,90 @@ void z_free(void *ptr) { k_free(ptr); }
 #endif
 
 K_THREAD_STACK_ARRAY_DEFINE(thread_stack_area, Z_THREADS_NUM, Z_PTHREAD_STACK_SIZE_DEFAULT);
-static int thread_index = 0;
+static bool thread_stack_used[Z_THREADS_NUM];
+static _z_task_t thread_stack_tasks[Z_THREADS_NUM];
+
+static int z_task_stack_take(void) {
+    for (int i = 0; i < Z_THREADS_NUM; ++i) {
+        if (!thread_stack_used[i]) {
+            thread_stack_used[i] = true;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void z_task_stack_release(_z_task_t task) {
+    for (int i = 0; i < Z_THREADS_NUM; ++i) {
+        if (thread_stack_used[i] && thread_stack_tasks[i] == task) {
+            thread_stack_used[i] = false;
+            thread_stack_tasks[i] = 0;
+            return;
+        }
+    }
+}
 
 /*------------------ Task ------------------*/
 z_result_t _z_task_init(_z_task_t *task, z_task_attr_t *attr, void *(*fun)(void *), void *arg) {
     z_task_attr_t *lattr = NULL;
     z_task_attr_t tmp;
+    int stack_slot = -1;
     if (attr == NULL) {
+        stack_slot = z_task_stack_take();
+        if (stack_slot < 0) {
+            _Z_ERROR_RETURN(_Z_ERR_SYSTEM_OUT_OF_MEMORY);
+        }
+
         (void)pthread_attr_init(&tmp);
-        (void)pthread_attr_setstack(&tmp, &thread_stack_area[thread_index++], Z_PTHREAD_STACK_SIZE_DEFAULT);
+        (void)pthread_attr_setstack(&tmp, &thread_stack_area[stack_slot], Z_PTHREAD_STACK_SIZE_DEFAULT);
         lattr = &tmp;
     }
 
-    _Z_CHECK_SYS_ERR(pthread_create(task, lattr, fun, arg));
+    int ret = pthread_create(task, lattr, fun, arg);
+    if (ret != 0) {
+        if (stack_slot >= 0) {
+            thread_stack_used[stack_slot] = false;
+        }
+        _z_report_system_error(ret);
+        _Z_ERROR_RETURN(_Z_ERR_SYSTEM_GENERIC);
+    }
+
+    if (stack_slot >= 0) {
+        thread_stack_tasks[stack_slot] = *task;
+    }
+
+    return _Z_RES_OK;
 }
 
-z_result_t _z_task_join(_z_task_t *task) { _Z_CHECK_SYS_ERR(pthread_join(*task, NULL)); }
+z_result_t _z_task_join(_z_task_t *task) {
+    int ret = pthread_join(*task, NULL);
+    if (ret != 0) {
+        _z_report_system_error(ret);
+        _Z_ERROR_RETURN(_Z_ERR_SYSTEM_GENERIC);
+    }
+
+    z_task_stack_release(*task);
+    return _Z_RES_OK;
+}
 
 z_result_t _z_task_detach(_z_task_t *task) { _Z_CHECK_SYS_ERR(pthread_detach(*task)); }
 
-z_result_t _z_task_cancel(_z_task_t *task) { _Z_CHECK_SYS_ERR(pthread_cancel(*task)); }
+z_result_t _z_task_cancel(_z_task_t *task) {
+    int ret = pthread_cancel(*task);
+    if (ret != 0) {
+        _z_report_system_error(ret);
+        _Z_ERROR_RETURN(_Z_ERR_SYSTEM_GENERIC);
+    }
 
-void _z_task_exit(void) { pthread_exit(NULL); }
+    z_task_stack_release(*task);
+    return _Z_RES_OK;
+}
+
+void _z_task_exit(void) {
+    z_task_stack_release(pthread_self());
+    pthread_exit(NULL);
+}
 
 void _z_task_free(_z_task_t **task) {
     _z_task_t *ptr = *task;
